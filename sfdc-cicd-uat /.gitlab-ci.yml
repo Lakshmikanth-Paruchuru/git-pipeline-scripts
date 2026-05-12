@@ -1,0 +1,253 @@
+---
+# ============================================================
+# Salesforce CI/CD — UAT Environment
+# Repo  : sfdc-cicd-uat
+# Org   : UAT / Partial Copy Sandbox (test.salesforce.com)
+# Stages: validate → deploy → post-deploy (auto-promote to Staging)
+# ============================================================
+#
+# Required GitLab CI/CD Variables:
+#   SF_UAT_JWT_PRIVATE_KEY   File variable — full PEM content of server.key
+#   SF_UAT_CONSUMER_KEY      Variable — Consumer Id from External Client App
+#   SF_UAT_USERNAME          Variable — Salesforce integration user username
+#   GITLAB_AUTOMATION_TOKEN  Variable — GitLab PAT with api scope
+#   NEXT_ENV_PROJECT_ID      Variable — numeric project ID of Staging repo
+# ============================================================
+
+image: salesforce/cli:latest-full
+
+cache:
+  key: ${CI_COMMIT_REF_SLUG}
+  paths: [node_modules/]
+
+stages:
+  - validate
+  - deploy
+  - post-deploy
+
+variables:
+  SF_INSTANCE_URL: "https://test.salesforce.com"
+  ENABLE_SF_DEPLOY: "true"
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
+
+.sf-auth-uat: &sf-auth-uat
+  before_script:
+    - |
+      if [ ! -f "${SF_UAT_JWT_PRIVATE_KEY}" ]; then
+        echo "ERROR: SF_UAT_JWT_PRIVATE_KEY must be a GitLab File variable."; exit 1
+      fi
+      cp "${SF_UAT_JWT_PRIVATE_KEY}" /tmp/server.key
+      FIRST_LINE="$(sed -n '1p' /tmp/server.key)"
+      if [ "${FIRST_LINE}" != "-----BEGIN PRIVATE KEY-----" ] && \
+         [ "${FIRST_LINE}" != "-----BEGIN RSA PRIVATE KEY-----" ]; then
+        echo "ERROR: Key is not a valid PEM private key. Got: ${FIRST_LINE}"; exit 1
+      fi
+      openssl pkey -in /tmp/server.key -noout >/dev/null 2>&1 || { echo "ERROR: Key unreadable."; exit 1; }
+    - chmod 600 /tmp/server.key
+    - |
+      sf org login jwt \
+        --client-id    "${SF_UAT_CONSUMER_KEY}" \
+        --jwt-key-file /tmp/server.key \
+        --username     "${SF_UAT_USERNAME}" \
+        --instance-url "${SF_INSTANCE_URL}" \
+        --alias        uat \
+        --set-default
+  after_script:
+    - rm -f /tmp/server.key
+
+validate-deploy-uat:
+  stage: validate
+  <<: *sf-auth-uat
+  rules:
+    - if: '$ENABLE_SF_DEPLOY == "true" && $CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: [force-app/**/*, manifest/**/*, sfdx-project.json]
+    - when: never
+  script:
+    - |
+      EMPTY_TREE="4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+      if [ -n "${CI_MERGE_REQUEST_TARGET_BRANCH_NAME:-}" ]; then
+        git fetch origin "${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}" --depth=50 >/dev/null 2>&1 || true
+        DIFF_BASE="${CI_MERGE_REQUEST_DIFF_BASE_SHA:-origin/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}}"
+      else
+        DIFF_BASE="${CI_COMMIT_BEFORE_SHA:-${EMPTY_TREE}}"
+      fi
+      [ -z "${DIFF_BASE}" ] || [ "${DIFF_BASE}" = "0000000000000000000000000000000000000000" ] && DIFF_BASE="${EMPTY_TREE}"
+
+      git diff --name-only --diff-filter=ACMR "${DIFF_BASE}" "${CI_COMMIT_SHA}" \
+        -- force-app manifest sfdx-project.json > changed-files.txt || true
+      grep -E '^force-app/' changed-files.txt > changed-force-app.txt || true
+
+      TEST_LEVEL="NoTestRun"
+      : > specified-tests.txt ; : > changed-non-test-apex.txt
+      grep -E '^force-app/.*/classes/[^/]+\.cls$' changed-force-app.txt > changed-apex-classes.txt || true
+
+      while IFS= read -r cls; do
+        [ -f "${cls}" ] || continue
+        name="$(basename "${cls}" .cls)"
+        case "${name}" in *Test|*Tests)
+          echo "${cls}" >> changed-test-apex.txt; continue ;;
+        esac
+        echo "${cls}" >> changed-non-test-apex.txt
+        grep -oE '<runTest>[[:space:]]*[A-Za-z0-9_]+[[:space:]]*</runTest>' "${cls}" \
+          | sed -E 's#<runTest>[[:space:]]*([A-Za-z0-9_]+)[[:space:]]*</runTest>#\1#' >> specified-tests.txt || true
+      done < changed-apex-classes.txt
+      sort -u specified-tests.txt | sed '/^$/d' > specified-tests-unique.txt || true
+
+      if [ -s specified-tests-unique.txt ]; then
+        TEST_LEVEL="RunSpecifiedTests"
+      elif [ -s changed-non-test-apex.txt ]; then
+        echo "ERROR: Non-test Apex changed but no <runTest> annotations found."; exit 1
+      elif [ -s changed-test-apex.txt ]; then
+        TEST_LEVEL="RunLocalTests"
+        echo "Only test classes changed — using RunLocalTests."
+      fi
+
+      if grep -qx 'manifest/package.xml' changed-files.txt; then
+        set -- sf project deploy start --dry-run --manifest manifest/package.xml \
+          --target-org uat --test-level "${TEST_LEVEL}" --json
+      elif [ -s changed-force-app.txt ]; then
+        awk '/^force-app\/main\/default\/(lwc|aura)\// {
+          n=split($0,a,"/"); print a[1]"/"a[2]"/"a[3]"/"a[4]"/"a[5]"/"a[6]; next } { print }' \
+          changed-force-app.txt | sort -u > changed-dirs.txt
+        set -- sf project deploy start --dry-run --target-org uat --test-level "${TEST_LEVEL}" --json
+        while IFS= read -r p; do [ -n "${p}" ] && set -- "$@" --source-dir "${p}"; done < changed-dirs.txt
+      else
+        echo "No metadata changes — skipping validation."; exit 0
+      fi
+      [ "${TEST_LEVEL}" = "RunSpecifiedTests" ] && \
+        while IFS= read -r t; do [ -n "${t}" ] && set -- "$@" --tests "${t}"; done < specified-tests-unique.txt
+      "$@" 2>&1 | tee deploy-validate-result.json
+      STATUS=$(python3 -c "import json; print(json.load(open('deploy-validate-result.json')).get('status',1))")
+      [ "${STATUS}" = "0" ] && echo "Validation PASSED" || { echo "Validation FAILED"; exit 1; }
+  artifacts:
+    when: always
+    paths: [deploy-validate-result.json]
+    expire_in: 7 days
+
+deploy-to-uat:
+  stage: deploy
+  <<: *sf-auth-uat
+  rules:
+    - if: '$ENABLE_SF_DEPLOY == "true" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
+      changes: [force-app/**/*, manifest/**/*, sfdx-project.json]
+    - when: never
+  environment:
+    name: uat
+  script:
+    - |
+      EMPTY_TREE="4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+      DIFF_BASE="${CI_COMMIT_BEFORE_SHA:-${EMPTY_TREE}}"
+      [ -z "${DIFF_BASE}" ] || [ "${DIFF_BASE}" = "0000000000000000000000000000000000000000" ] && DIFF_BASE="${EMPTY_TREE}"
+
+      git diff --name-only --diff-filter=ACMR "${DIFF_BASE}" "${CI_COMMIT_SHA}" \
+        -- force-app manifest sfdx-project.json > changed-files.txt || true
+      grep -E '^force-app/' changed-files.txt > changed-force-app.txt || true
+
+      TEST_LEVEL="NoTestRun"
+      grep -E '^force-app/.*/classes/[^/]+\.cls$' changed-force-app.txt > changed-apex-classes.txt || true
+      if [ -s changed-apex-classes.txt ]; then
+        TEST_LEVEL="RunLocalTests"
+      fi
+
+      if grep -qx 'manifest/package.xml' changed-files.txt; then
+        sf project deploy start --manifest manifest/package.xml \
+          --target-org uat --test-level "${TEST_LEVEL}" --json 2>&1 | tee deploy-result.json
+      elif [ -s changed-force-app.txt ]; then
+        awk '/^force-app\/main\/default\/(lwc|aura)\// {
+          n=split($0,a,"/"); print a[1]"/"a[2]"/"a[3]"/"a[4]"/"a[5]"/"a[6]; next } { print }' \
+          changed-force-app.txt | sort -u > changed-dirs.txt
+        set -- sf project deploy start --target-org uat --test-level "${TEST_LEVEL}" --json
+        while IFS= read -r p; do [ -n "${p}" ] && set -- "$@" --source-dir "${p}"; done < changed-dirs.txt
+        "$@" 2>&1 | tee deploy-result.json
+      else
+        echo "No metadata changes — skipping deploy."; exit 0
+      fi
+    - |
+      python3 - <<'PYEOF'
+      import json, sys
+      d = json.load(open("deploy-result.json"))
+      r = d.get("result", {})
+      ok = str(d.get("status", 1)) == "0" and r.get("success", False)
+      print(f"Status   : {d.get('status')}")
+      print(f"Tests OK : {r.get('numberTestsCompleted', 0)}")
+      print(f"Tests ERR: {r.get('numberTestErrors', 0)}")
+      sys.exit(0 if ok else 1)
+      PYEOF
+  artifacts:
+    when: always
+    paths: [deploy-result.json]
+    expire_in: 30 days
+
+promote-to-staging:
+  stage: post-deploy
+  image: alpine:latest
+  needs: [deploy-to-uat]
+  rules:
+    - if: '$ENABLE_SF_DEPLOY == "true" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
+      changes: [force-app/**/*, manifest/**/*, sfdx-project.json]
+    - when: never
+  script:
+    - apk add --no-cache git curl jq >/dev/null
+    - |
+      STG_JSON="$(curl -sf --header "PRIVATE-TOKEN: ${GITLAB_AUTOMATION_TOKEN}" \
+        "${CI_API_V4_URL}/projects/${NEXT_ENV_PROJECT_ID}")"
+      STG_URL="$(echo "${STG_JSON}" | jq -r '.http_url_to_repo')"
+      STG_BRANCH="$(echo "${STG_JSON}" | jq -r '.default_branch')"
+      [ -z "${STG_URL}" ] || [ "${STG_URL}" = "null" ] && { echo "ERROR: Cannot resolve Staging repo URL."; exit 1; }
+
+      CLONE_URL="$(echo "${STG_URL}" | sed "s#https://#https://oauth2:${GITLAB_AUTOMATION_TOKEN}@#")"
+      git clone --depth 1 --branch "${STG_BRANCH}" "${CLONE_URL}" next-repo
+      git -C next-repo config user.email "ci-bot@pipeline.local"
+      git -C next-repo config user.name "GitLab CI Promote Bot"
+
+      EMPTY_TREE="4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+      DIFF_BASE="${CI_COMMIT_BEFORE_SHA:-${EMPTY_TREE}}"
+      [ -z "${DIFF_BASE}" ] || [ "${DIFF_BASE}" = "0000000000000000000000000000000000000000" ] && DIFF_BASE="${EMPTY_TREE}"
+
+      git diff --name-only --diff-filter=ACMR "${DIFF_BASE}" "${CI_COMMIT_SHA}" \
+        -- force-app manifest sfdx-project.json > promote-upserts.txt || true
+      git diff --name-only --diff-filter=D "${DIFF_BASE}" "${CI_COMMIT_SHA}" \
+        -- force-app manifest sfdx-project.json > promote-deletes.txt || true
+      [ ! -s promote-upserts.txt ] && [ ! -s promote-deletes.txt ] && { echo "Nothing to promote."; exit 0; }
+
+      while IFS= read -r path; do
+        [ -n "${path}" ] && [ -f "${path}" ] || continue
+        mkdir -p "next-repo/$(dirname "${path}")"
+        cp "${path}" "next-repo/${path}"
+        git -C next-repo add "${path}"
+      done < promote-upserts.txt
+
+      while IFS= read -r path; do
+        [ -n "${path}" ] || continue
+        rm -f "next-repo/${path}" || true
+        git -C next-repo rm -f --ignore-unmatch "${path}" || true
+      done < promote-deletes.txt
+
+      git -C next-repo diff --cached --quiet && { echo "No changes to promote."; exit 0; }
+      git -C next-repo commit -m "chore: promote from UAT ${CI_COMMIT_SHORT_SHA}"
+      git -C next-repo push origin "HEAD:${STG_BRANCH}"
+      PROMOTE_SHA="$(git -C next-repo rev-parse HEAD)"
+      echo "Promoted → Staging (${PROMOTE_SHA})"
+
+      NEXT_PIPELINE_ID=""
+      for _ in $(seq 1 24); do
+        NEXT_PIPELINE_ID="$(curl -s --header "PRIVATE-TOKEN: ${GITLAB_AUTOMATION_TOKEN}" \
+          "${CI_API_V4_URL}/projects/${NEXT_ENV_PROJECT_ID}/pipelines?sha=${PROMOTE_SHA}&per_page=1" \
+          | jq -r '.[0].id // empty')"
+        [ -n "${NEXT_PIPELINE_ID}" ] && break; sleep 5
+      done
+      [ -z "${NEXT_PIPELINE_ID}" ] && { echo "WARNING: Staging pipeline not found."; exit 0; }
+
+      STATUS="running"
+      for _ in $(seq 1 90); do
+        STATUS="$(curl -sf --header "PRIVATE-TOKEN: ${GITLAB_AUTOMATION_TOKEN}" \
+          "${CI_API_V4_URL}/projects/${NEXT_ENV_PROJECT_ID}/pipelines/${NEXT_PIPELINE_ID}" | jq -r '.status')"
+        echo "Staging pipeline: ${STATUS}"
+        case "${STATUS}" in success|failed|canceled|skipped|manual) break ;; esac; sleep 10
+      done
+      [ "${STATUS}" = "success" ] && { echo "Staging pipeline PASSED"; exit 0; }
+      echo "Staging pipeline ended: ${STATUS}"; exit 1
